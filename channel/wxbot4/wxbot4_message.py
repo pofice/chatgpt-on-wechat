@@ -77,7 +77,7 @@ class Wxbot4Message(ChatMessage):
         self.to_user_id = client_id
         self.to_user_nickname = client_id
         self.is_group = is_group
-        self.my_msg = (msg_type == "self" or sender == client_id)
+        self.my_msg = (sender == "self" or msg_type == "self" or sender == client_id)
 
         if is_group:
             self.other_user_id = chat_name
