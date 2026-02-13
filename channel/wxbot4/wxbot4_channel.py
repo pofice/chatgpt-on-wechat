@@ -251,7 +251,10 @@ class Wxbot4Channel(ChatChannel):
 
             # 转换为 ChatMessage
             cmsg = Wxbot4Message(payload)
-            logger.info(f"[wxbot4] 收到消息: [{cmsg.ctype}] {cmsg.from_user_nickname}: {cmsg.content[:50]}")
+            logger.info(f"[wxbot4] 收到消息: chat={cmsg.other_user_nickname}, "
+                        f"sender={cmsg.from_user_nickname}, type={cmsg.ctype}, is_group={cmsg.is_group}, "
+                        f"my_msg={cmsg.my_msg}, content={cmsg.content[:80]}")
+            logger.debug(f"[wxbot4] 原始 data={data}")
 
             # 构造 context 并入队处理
             context = self._compose_context(
