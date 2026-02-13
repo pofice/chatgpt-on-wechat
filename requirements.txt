@@ -26,3 +26,6 @@ dashscope
 lark-oapi
 # dingtalk
 dingtalk_stream
+
+# wxbot4 (RabbitMQ)
+pika

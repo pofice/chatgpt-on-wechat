@@ -21,6 +21,9 @@ def create_channel(channel_type) -> Channel:
     elif channel_type == "wcf":
         from channel.wechat.wcf_channel import WechatfChannel
         ch = WechatfChannel()
+    elif channel_type == "wxbot4":
+        from channel.wxbot4.wxbot4_channel import Wxbot4Channel
+        ch = Wxbot4Channel()
     elif channel_type == "terminal":
         from channel.terminal.terminal_channel import TerminalChannel
         ch = TerminalChannel()
