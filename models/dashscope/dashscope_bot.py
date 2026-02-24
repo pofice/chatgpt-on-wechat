@@ -255,36 +255,54 @@ class DashscopeBot(Bot):
         try:
             # Set API key before calling
             dashscope.api_key = self.api_key
-            
-            response = dashscope.Generation.call(
-                model=dashscope_models.get(model_name, model_name),
-                messages=messages,
-                **parameters
-            )
-            
+            model = dashscope_models.get(model_name, model_name)
+
+            if self._is_multimodal_model(model_name):
+                messages = self._prepare_messages_for_multimodal(messages)
+                response = MultiModalConversation.call(
+                    model=model,
+                    messages=messages,
+                    **parameters
+                )
+            else:
+                response = dashscope.Generation.call(
+                    model=model,
+                    messages=messages,
+                    **parameters
+                )
+
             if response.status_code == HTTPStatus.OK:
-                # Convert DashScope response to OpenAI-compatible format
-                choice = response.output.choices[0]
+                # Convert response to dict to avoid DashScope object KeyError issues
+                resp_dict = self._response_to_dict(response)
+                choice = resp_dict["output"]["choices"][0]
+                message = choice.get("message", {})
+                content = message.get("content", "")
+                # Multimodal models may return content as a list of blocks
+                if isinstance(content, list):
+                    content = "".join(
+                        item.get("text", "") for item in content if isinstance(item, dict)
+                    )
+                usage = resp_dict.get("usage", {})
                 return {
-                    "id": response.request_id,
+                    "id": resp_dict.get("request_id"),
                     "object": "chat.completion",
                     "created": 0,
                     "model": model_name,
                     "choices": [{
                         "index": 0,
                         "message": {
-                            "role": choice.message.role,
-                            "content": choice.message.content,
+                            "role": message.get("role", "assistant"),
+                            "content": content,
                             "tool_calls": self._convert_tool_calls_to_openai_format(
-                                choice.message.get("tool_calls")
+                                message.get("tool_calls")
                             )
                         },
-                        "finish_reason": choice.finish_reason
+                        "finish_reason": choice.get("finish_reason")
                     }],
                     "usage": {
-                        "prompt_tokens": response.usage.input_tokens,
-                        "completion_tokens": response.usage.output_tokens,
-                        "total_tokens": response.usage.total_tokens
+                        "prompt_tokens": usage.get("input_tokens", 0),
+                        "completion_tokens": usage.get("output_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0)
                     }
                 }
             else:
@@ -294,7 +312,7 @@ class DashscopeBot(Bot):
                     "message": response.message,
                     "status_code": response.status_code
                 }
-                
+
         except Exception as e:
             logger.error(f"[DASHSCOPE] sync response error: {e}")
             return {
@@ -308,48 +326,52 @@ class DashscopeBot(Bot):
         try:
             # Set API key before calling
             dashscope.api_key = self.api_key
-            
-            responses = dashscope.Generation.call(
-                model=dashscope_models.get(model_name, model_name),
-                messages=messages,
-                stream=True,
-                **parameters
-            )
+            model = dashscope_models.get(model_name, model_name)
+
+            if self._is_multimodal_model(model_name):
+                messages = self._prepare_messages_for_multimodal(messages)
+                responses = MultiModalConversation.call(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    **parameters
+                )
+            else:
+                responses = dashscope.Generation.call(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    **parameters
+                )
             
             # Stream chunks to caller, converting to OpenAI format
             for response in responses:
-                if response.status_code != HTTPStatus.OK:
-                    logger.error(f"[DASHSCOPE] Stream error: {response.code} - {response.message}")
+                # Convert to dict first to avoid DashScope proxy object KeyError
+                resp_dict = self._response_to_dict(response)
+                status_code = resp_dict.get("status_code", 200)
+
+                if status_code != HTTPStatus.OK:
+                    err_code = resp_dict.get("code", "")
+                    err_msg = resp_dict.get("message", "Unknown error")
+                    logger.error(f"[DASHSCOPE] Stream error: {err_code} - {err_msg}")
                     yield {
                         "error": True,
-                        "message": response.message,
-                        "status_code": response.status_code
+                        "message": err_msg,
+                        "status_code": status_code
                     }
                     continue
-                
-                # Get choice - use try-except because DashScope raises KeyError on hasattr()
-                try:
-                    if isinstance(response.output, dict):
-                        choice = response.output['choices'][0]
-                    else:
-                        choice = response.output.choices[0]
-                except (KeyError, AttributeError, IndexError) as e:
-                    logger.warning(f"[DASHSCOPE] Cannot get choice: {e}")
+
+                choices = resp_dict.get("output", {}).get("choices", [])
+                if not choices:
                     continue
-                
-                # Get finish_reason safely
-                finish_reason = None
-                try:
-                    if isinstance(choice, dict):
-                        finish_reason = choice.get('finish_reason')
-                    else:
-                        finish_reason = choice.finish_reason
-                except (KeyError, AttributeError):
-                    pass
-                
+
+                choice = choices[0]
+                finish_reason = choice.get("finish_reason")
+                message = choice.get("message", {})
+
                 # Convert to OpenAI-compatible format
                 openai_chunk = {
-                    "id": response.request_id,
+                    "id": resp_dict.get("request_id"),
                     "object": "chat.completion.chunk",
                     "created": 0,
                     "model": model_name,
@@ -359,60 +381,35 @@ class DashscopeBot(Bot):
                         "finish_reason": finish_reason
                     }]
                 }
-                
-                # Get message safely - use try-except
-                message = {}
-                try:
-                    if isinstance(choice, dict):
-                        message = choice.get('message', {})
-                    else:
-                        message = choice.message
-                except (KeyError, AttributeError):
-                    pass
-                
-                # Add role if present
-                role = None
-                try:
-                    if isinstance(message, dict):
-                        role = message.get('role')
-                    else:
-                        role = message.role
-                except (KeyError, AttributeError):
-                    pass
+
+                # Add role
+                role = message.get("role")
                 if role:
                     openai_chunk["choices"][0]["delta"]["role"] = role
-                
-                # Add content if present
-                content = None
-                try:
-                    if isinstance(message, dict):
-                        content = message.get('content')
-                    else:
-                        content = message.content
-                except (KeyError, AttributeError):
-                    pass
+
+                # Add reasoning_content (thinking process from models like qwen3.5)
+                reasoning_content = message.get("reasoning_content")
+                if reasoning_content:
+                    openai_chunk["choices"][0]["delta"]["reasoning_content"] = reasoning_content
+
+                # Add content (multimodal models may return list of blocks)
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "".join(
+                        item.get("text", "") for item in content if isinstance(item, dict)
+                    )
                 if content:
                     openai_chunk["choices"][0]["delta"]["content"] = content
-                
-                # Add tool_calls if present
-                # DashScope's response object raises KeyError on hasattr() if attr doesn't exist
-                # So we use try-except instead
-                tool_calls = None
-                try:
-                    if isinstance(message, dict):
-                        tool_calls = message.get('tool_calls')
-                    else:
-                        tool_calls = message.tool_calls
-                except (KeyError, AttributeError):
-                    pass
-                
+
+                # Add tool_calls
+                tool_calls = message.get("tool_calls")
                 if tool_calls:
                     openai_chunk["choices"][0]["delta"]["tool_calls"] = self._convert_tool_calls_to_openai_format(tool_calls)
-                
+
                 yield openai_chunk
-                
+
         except Exception as e:
-            logger.error(f"[DASHSCOPE] stream response error: {e}")
+            logger.error(f"[DASHSCOPE] stream response error: {e}", exc_info=True)
             yield {
                 "error": True,
                 "message": str(e),
@@ -468,6 +465,35 @@ class DashscopeBot(Bot):
             result[attr] = _to_dict(val)
         return result
 
+
+    def _convert_tools_to_dashscope_format(self, tools):
+        """
+        Convert tools from Claude format to DashScope format
+        
+        Claude format: {name, description, input_schema}
+        DashScope format: {type: "function", function: {name, description, parameters}}
+        """
+        if not tools:
+            return None
+        
+        dashscope_tools = []
+        for tool in tools:
+            # Check if already in DashScope/OpenAI format
+            if 'type' in tool and tool['type'] == 'function':
+                dashscope_tools.append(tool)
+            else:
+                # Convert from Claude format
+                dashscope_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name"),
+                        "description": tool.get("description"),
+                        "parameters": tool.get("input_schema", {})
+                    }
+                })
+        
+        return dashscope_tools
+    
     @staticmethod
     def _prepare_messages_for_multimodal(messages: list) -> list:
         """
@@ -499,34 +525,6 @@ class DashscopeBot(Bot):
             result.append(msg)
         return result
 
-    def _convert_tools_to_dashscope_format(self, tools):
-        """
-        Convert tools from Claude format to DashScope format
-        
-        Claude format: {name, description, input_schema}
-        DashScope format: {type: "function", function: {name, description, parameters}}
-        """
-        if not tools:
-            return None
-        
-        dashscope_tools = []
-        for tool in tools:
-            # Check if already in DashScope/OpenAI format
-            if 'type' in tool and tool['type'] == 'function':
-                dashscope_tools.append(tool)
-            else:
-                # Convert from Claude format
-                dashscope_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name"),
-                        "description": tool.get("description"),
-                        "parameters": tool.get("input_schema", {})
-                    }
-                })
-        
-        return dashscope_tools
-    
     def _convert_messages_to_dashscope_format(self, messages):
         """
         Convert messages from Claude format to DashScope format
