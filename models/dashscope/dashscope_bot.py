@@ -10,6 +10,7 @@ from config import conf, load_config
 from .dashscope_session import DashscopeSession
 import os
 import dashscope
+from dashscope import MultiModalConversation
 from http import HTTPStatus
 
 
@@ -23,6 +24,11 @@ dashscope_models = {
     "qwen-bailian-v1": dashscope.Generation.Models.bailian_v1,
 }
 
+# Model name prefixes that require MultiModalConversation API instead of Generation API.
+# Qwen3.5+ series are omni models that only support MultiModalConversation.
+MULTIMODAL_MODEL_PREFIXES = ("qwen3.5-",)
+
+
 # Qwen对话模型API
 class DashscopeBot(Bot):
     def __init__(self):
@@ -33,6 +39,11 @@ class DashscopeBot(Bot):
         if self.api_key:
             os.environ["DASHSCOPE_API_KEY"] = self.api_key
         self.client = dashscope.Generation
+
+    @staticmethod
+    def _is_multimodal_model(model_name: str) -> bool:
+        """Check if the model requires MultiModalConversation API"""
+        return model_name.startswith(MULTIMODAL_MODEL_PREFIXES)
 
     def reply(self, query, context=None):
         # acquire reply content
@@ -88,16 +99,33 @@ class DashscopeBot(Bot):
         """
         try:
             dashscope.api_key = self.api_key
-            response = self.client.call(
-                dashscope_models.get(self.model_name, self.model_name),
-                messages=session.messages,
-                result_format="message"
-            )
+            model = dashscope_models.get(self.model_name, self.model_name)
+            if self._is_multimodal_model(self.model_name):
+                mm_messages = self._prepare_messages_for_multimodal(session.messages)
+                response = MultiModalConversation.call(
+                    model=model,
+                    messages=mm_messages,
+                    result_format="message"
+                )
+            else:
+                response = self.client.call(
+                    model,
+                    messages=session.messages,
+                    result_format="message"
+                )
             if response.status_code == HTTPStatus.OK:
-                content = response.output.choices[0]["message"]["content"]
+                resp_dict = self._response_to_dict(response)
+                choice = resp_dict["output"]["choices"][0]
+                content = choice.get("message", {}).get("content", "")
+                # Multimodal models may return content as a list of blocks
+                if isinstance(content, list):
+                    content = "".join(
+                        item.get("text", "") for item in content if isinstance(item, dict)
+                    )
+                usage = resp_dict.get("usage", {})
                 return {
-                    "total_tokens": response.usage["total_tokens"],
-                    "completion_tokens": response.usage["output_tokens"],
+                    "total_tokens": usage.get("total_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
                     "content": content,
                 }
             else:
@@ -391,6 +419,86 @@ class DashscopeBot(Bot):
                 "status_code": 500
             }
     
+    @staticmethod
+    def _response_to_dict(response) -> dict:
+        """
+        Convert DashScope response object to a plain dict.
+
+        DashScope SDK wraps responses in proxy objects whose __getattr__
+        delegates to __getitem__, raising KeyError (not AttributeError)
+        when an attribute is missing.  Standard hasattr / getattr only
+        catch AttributeError, so we must use try-except everywhere.
+        """
+        _SENTINEL = object()
+
+        def _safe_getattr(obj, name, default=_SENTINEL):
+            """getattr that also catches KeyError from DashScope proxy objects."""
+            try:
+                return getattr(obj, name)
+            except (AttributeError, KeyError, TypeError):
+                return default
+
+        def _has_attr(obj, name):
+            return _safe_getattr(obj, name) is not _SENTINEL
+
+        def _to_dict(obj):
+            if isinstance(obj, (str, int, float, bool, type(None))):
+                return obj
+            if isinstance(obj, dict):
+                return {k: _to_dict(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_dict(i) for i in obj]
+            # DashScope response objects behave like dicts (have .keys())
+            if _has_attr(obj, "keys"):
+                try:
+                    return {k: _to_dict(obj[k]) for k in obj.keys()}
+                except Exception:
+                    pass
+            return obj
+
+        result = {}
+        # Extract known top-level fields safely
+        for attr in ("request_id", "status_code", "code", "message", "output", "usage"):
+            val = _safe_getattr(response, attr)
+            if val is _SENTINEL:
+                try:
+                    val = response[attr]
+                except (KeyError, TypeError, IndexError):
+                    continue
+            result[attr] = _to_dict(val)
+        return result
+
+    @staticmethod
+    def _prepare_messages_for_multimodal(messages: list) -> list:
+        """
+        Ensure messages are compatible with MultiModalConversation API.
+
+        MultiModalConversation._preprocess_messages iterates every message
+        with ``content = message["content"]; for elem in content: ...``,
+        which means:
+          1. Every message MUST have a 'content' key.
+          2. 'content' MUST be an iterable (list), not a plain string.
+             The expected format is [{"text": "..."}, ...].
+
+        Meanwhile the DashScope API requires role='tool' messages to follow
+        assistant tool_calls, so we must NOT convert them to role='user'.
+        We just ensure they have a list-typed 'content'.
+        """
+        result = []
+        for msg in messages:
+            msg = dict(msg)  # shallow copy
+
+            # Normalize content to list format [{"text": "..."}]
+            content = msg.get("content")
+            if content is None or (isinstance(content, str) and content == ""):
+                msg["content"] = [{"text": ""}]
+            elif isinstance(content, str):
+                msg["content"] = [{"text": content}]
+            # If content is already a list, keep as-is (already in multimodal format)
+
+            result.append(msg)
+        return result
+
     def _convert_tools_to_dashscope_format(self, tools):
         """
         Convert tools from Claude format to DashScope format
